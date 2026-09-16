@@ -5,17 +5,50 @@ This is a project to enable a jump-start on UI design and build within the Godot
 
 Forked from https://github.com/mightymochi/figma-to-godot-experiment
 
+### Preserve the exported layout
+
+`Preserve Figma Layout` is enabled by default. It keeps exported positions, sizes, rotations, mirror transforms, and reverse layer order. Figma auto-layout coordinates already include padding, so this mode does not add container padding or reflow the children. Disable it to use the original Godot auto-layout conversion.
+
+`Merge Sliced Backgrounds` is also enabled by default. With layout preservation and image import enabled, complete 3×3, 3×1, or 1×3 grids of plain image rectangles become one background texture. Shared pixel boundaries and repaired internal PNG fringes prevent seams when the scene is scaled. Text and other controls remain independent. Missing tiles or unsupported grids fall back to individual nodes. Disable merging when you need to edit the pieces separately; merged backgrounds resize as a whole image.
+
+After updating the importer, remove the previously generated frame children (keep the FigmaImporter node), run **Process JSON**, select the page and frame again, then click **Import Frames**. Existing generated scenes are not rewritten by a plugin update.
+
+The imported frame keeps its design resolution. For example, a 1920 × 1080 design can be fitted to a 1280 × 720 viewport by uniformly scaling its imported root to `Vector2(0.666667, 0.666667)`.
+
+Text supports solid, linear-gradient, and radial-gradient fills, with independent solid outlines. Vector and boolean nodes with exported `fillGeometry` support solid and linear-gradient fills. Boolean operands are retained as hidden children so their shapes do not cover the composite result.
+
+To check an exported frame, keep its JSON, `fonts`, and `images` together and run from the Godot project directory:
+
+```sh
+godot --headless --path . --script res://addons/figma_importer/tests/render_layout.gd -- res://assets/lobby/figma_export.json
+```
+
+The check creates the first exported frame, compares node transforms and sizes with the JSON, checks text visibility and layer order, saves a test scene under `user://`, and repeats the checks after loading it. It does not modify the source JSON or project scenes.
+
+The slice compositor also has a standalone check using generated images:
+
+```sh
+godot --headless --path . --script res://addons/figma_importer/tests/sliced_backgrounds.gd
+```
+
+To check image sizing and scene save/reload behavior, run:
+
+```sh
+godot --headless --path . --script res://addons/figma_importer/tests/image_fills.gd
+```
+
+Optionally append `-- <figma_export.json> <images_folder> <fonts_folder>` to also check cropped images in the first exported frame.
+
 ### Support and Development
 + This is currently a for-fun personal project. I will be updating and working on making this a more flexible plugin in my free time. If you would like to contract me to update or customize this for your project or organization, contact Nate at mightymochigames@gmail.com.
 + For general info communication or to share what you did with your project, visit the Discord: https://discord.gg/4JsqksKMhg
 
 ### Compatibility Issues
-+ The importer does not support vectors/polygons/stars/arrows, but it will add a frame in it's place. To use these types of images you will need to export them separately and place them manually within Godot. When an image is missing or unsupported you will see an error texture that says `Missing or Unsupported File`.
-+ Figma image crop. Godot will place the image but you will need to re-crop within the frame.
++ Shapes without supported exported `fillGeometry` still need to be exported separately. Unsupported or missing images use the `Missing or Unsupported File` texture. Vector image fills, vector strokes, effects, and gradient text outlines are not currently reproduced.
++ Cropped image fills use **Fill** because the [Figma exporter](https://github.com/morganwalkup/figma-godot-exporter/blob/main/main.js) rasterizes the node into its PNG. For example, a 56 × 56 decoration with `CROP` and `scalingFactor: 0.5` fills its 56 × 56 node without applying that scale again. Original uncropped source images still require manual cropping.
 + Gradients. I am using Godot gradient textures and they do not support the squash and stretch of radial gradients.
 + Shadows. Figma shadows have more settings than Godot StyleBox shadows support.
-+ Groups. Children of groups within Figma maintain an absolute position instead of a relative. I have not set up the code to handle this yet.
-+ Figma's Flip Horizontal/Vertical. Figma flips by rotating and changing scale. If the frame is part of an autolayout, Godot will not "flip" the frame. If it is just an image, use the Flip_X or Flip_Y option in the Fill texture section.
++ Absolute transforms are used when available to recover parent-relative positions for groups and boolean operands. The legacy auto-layout conversion can still reposition children; use `Preserve Figma Layout` when matching the original design takes priority.
 
 ### Disclamer
 + Game performance has not been tested. There may be, and probably is, more optimized ways of building UI elements depending on the game or application. Use the importer and related classes to jump start your development. 

@@ -2,6 +2,8 @@
 class_name FigmaImporter
 extends Control
 
+const SliceBackground = preload("figma_slice_background.gd")
+
 var script_dir:String = get_script().get_path().get_base_dir()
 
 @export_category("Figma JSON Import")
@@ -18,6 +20,10 @@ var is_json_proc:bool = false
 		SelectFrame = value
 		notify_property_list_changed()
 @export_group("Import Options")
+## Keep the exported positions and sizes. Disable to convert Figma auto layout into Godot containers.
+@export var preserve_figma_layout:bool = true
+## Combine three-part and nine-part image backgrounds into one texture to avoid seams.
+@export var merge_sliced_backgrounds:bool = true
 ## Select the folder to where you copied your fonts. Leaving this empy will result in using Godot's default font.
 @export_dir var fonts_folder
 ## Select the folder to where you copied your images. Leaving this empty will result in images not being imported.
@@ -94,6 +100,8 @@ func json_load(_stuff):
 
 func run_arrange(_newVar):
 	if document_json_file != null:
+		# Reprocessing must not retain nodes from an earlier document or failed import.
+		processed_json_dict.clear()
 		is_json_proc = true
 		#Load the file.
 		var data_file = FileAccess.open(document_json_file, FileAccess.READ)
@@ -104,18 +112,25 @@ func run_arrange(_newVar):
 		frame_hints = ""
 		SelectFrame = ""
 		if data_parsed.has("children"):
-			cycle_children(data_parsed["children"])
+			cycle_children(data_parsed["children"], str(data_parsed.get("id", "")))
 		else:
 			print("Empty document")
 	else:
 		print("no json file")
 
-func cycle_children(what_to_process):
+func cycle_children(what_to_process, parent_id:String = ""):
 	pass
 	if what_to_process.size() > 0:
 		for new_item in what_to_process.size():
 			var fig_id = test_key(what_to_process[new_item],"id")
 			var fig_name = test_key(what_to_process[new_item],"name")
+			# Frame exports from older exporters omit parent on the page wrapper.
+			# The enclosing children array already supplies the missing relationship.
+			var fig_parent:String = parent_id
+			var parent_data = what_to_process[new_item].get("parent")
+			if parent_data is Dictionary and parent_data.get("id") is String:
+				if not parent_data["id"].is_empty():
+					fig_parent = parent_data["id"]
 			var fig_children:Array
 			var fig_comp_props:Dictionary
 			var fig_comp_prop_defs:Dictionary
@@ -138,7 +153,7 @@ func cycle_children(what_to_process):
 			processed_json_dict[fig_id] = {
 				"type" : test_key(what_to_process[new_item],"type"),
 				"name" : fig_name,
-				"parent": test_key(what_to_process[new_item]["parent"],"id"),
+				"parent": fig_parent,
 				"x" : test_key(what_to_process[new_item],"x"),
 				"y" : test_key(what_to_process[new_item],"y"),
 				"width" : test_key(what_to_process[new_item],"width"),
@@ -177,17 +192,29 @@ func cycle_children(what_to_process):
 				"fontWeight": test_key(what_to_process[new_item],"fontWeight"),
 				"fontSize": test_key(what_to_process[new_item],"fontSize"),
 				"fontStrokeWeight": test_key(what_to_process[new_item],"strokeWeight"),
-				"relativeTransform": test_key(what_to_process[new_item],"relativeTransform")
+				"letterSpacing": test_key(what_to_process[new_item],"letterSpacing"),
+				"textAutoResize": test_key(what_to_process[new_item],"textAutoResize"),
+				"visible": what_to_process[new_item].get("visible", true),
+				"opacity": what_to_process[new_item].get("opacity", 1.0),
+				"effects": what_to_process[new_item].get("effects", []),
+				"blendMode": what_to_process[new_item].get("blendMode", "NORMAL"),
+				"reverse_z": what_to_process[new_item].get("itemReverseZIndex", false),
+				"fillGeometry": what_to_process[new_item].get("fillGeometry", []),
+				"relativeTransform": test_key(what_to_process[new_item],"relativeTransform"),
+				"absoluteTransform": test_key(what_to_process[new_item],"absoluteTransform")
 			}
 			if with_child:
-				cycle_children(what_to_process[new_item]["children"])
+				cycle_children(what_to_process[new_item]["children"], fig_id)
 
 func renderFrameArray(_stuff):
 	var frame_id = strip_to_id(SelectFrame)
 	renderFrameAndContents(frame_id,self,true)
 
 func renderChildFrames(frame,parent):
-	for object_id in processed_json_dict[frame]["children"]:
+	var children:Array = processed_json_dict[frame]["children"].duplicate()
+	if processed_json_dict[frame].get("reverse_z", false):
+		children.reverse()
+	for object_id in children:
 		renderFrameAndContents(object_id,parent,false)
 
 func renderFrameAndContents(object_id,parent,position_override:bool):
@@ -201,7 +228,10 @@ func renderFrameAndContents(object_id,parent,position_override:bool):
 	else:
 		var newFrame
 		var isRectangle:bool = false
-		if the_type == "RECTANGLE":
+		var sliced:Dictionary = {}
+		if preserve_figma_layout and merge_sliced_backgrounds and autoPlaceImages and images_folder is String:
+			sliced = SliceBackground.compose(processed_json_dict[object_id], processed_json_dict, images_folder)
+		if the_type == "RECTANGLE" or not sliced.is_empty():
 			isRectangle = true
 		if isRectangle:
 			newFrame = DesignerImagePanel.new()
@@ -209,18 +239,22 @@ func renderFrameAndContents(object_id,parent,position_override:bool):
 			newFrame = DesignerFrame.new()
 		newFrame.name = processed_json_dict[object_id]["name"]+" xIDx"+ make_safeName(object_id)+"x"
 		parent.add_child(newFrame)
-		newFrame.set_owner(get_tree().get_edited_scene_root())
+		newFrame.set_owner(import_scene_owner())
 		newFrame.use_solid_fill = false
+		if not sliced.is_empty():
+			newFrame.fill_texture = sliced.texture
+			newFrame.textureSizeMode = "Stretch"
+			newFrame.set_meta("figma_slice_children", sliced.children)
 		if !isRectangle:
 			newFrame.scrollingMode = "None"
 			var newControl = Control.new()
 			newControl.name = "InnerContainer"
 			newFrame.add_child(newControl)
 			newFrame.inner_container = newControl.get_path()
-			newFrame.get_node(newFrame.inner_container).set_owner(get_tree().get_edited_scene_root())
+			newFrame.get_node(newFrame.inner_container).set_owner(import_scene_owner())
 		newFrame.the_id = object_id
-		newFrame.widthSizeMode = processed_json_dict[object_id]["layout_horiz_sizing"]
-		newFrame.heightSizeMode = processed_json_dict[object_id]["layout_vert_sizing"]
+		newFrame.widthSizeMode = "FIXED" if preserve_figma_layout else processed_json_dict[object_id]["layout_horiz_sizing"]
+		newFrame.heightSizeMode = "FIXED" if preserve_figma_layout else processed_json_dict[object_id]["layout_vert_sizing"]
 		if processed_json_dict[object_id]["minWidth"] != null:
 			newFrame.minSize.x = processed_json_dict[object_id]["minWidth"]
 		else:
@@ -246,24 +280,25 @@ func renderFrameAndContents(object_id,parent,position_override:bool):
 			newFrame.set_deferred("position", Vector2(0.0,0.0))
 		else:
 			newFrame.set_deferred("position", Vector2(processed_json_dict[object_id]["x"],processed_json_dict[object_id]["y"]))
-		newFrame.set_deferred("rotation_degrees", processed_json_dict[object_id]["rotation"] * -1)
-		if processed_json_dict[object_id]["relativeTransform"][0][0] < 0:
-			newFrame.scale.y *= -1
-		if processed_json_dict[object_id]["relativeTransform"][1][1] < 0:
-			newFrame.scale.y *= -1
-		newFrame.set_deferred("center_rotation", true)
+		# Use one matrix decomposition for rotations and both mirror directions.
+		apply_figma_geometry.call_deferred(newFrame, object_id, position_override)
 		if !isRectangle:
-			newFrame.padding = processed_json_dict[object_id]["padding"]
+			# Figma child coordinates already include padding; adding it again shifts every child.
+			newFrame.padding = [0, 0, 0, 0] if preserve_figma_layout else processed_json_dict[object_id]["padding"]
 		newFrame.fill_color = Color(0.0,0.0,0.0,0.0)
-		if the_type == "POLYGON" || the_type == "VECTOR" || the_type == "STAR":
-			place_error_image(newFrame)
+		var vector_rendered:bool = false
+		if the_type in ["POLYGON", "VECTOR", "STAR", "BOOLEAN_OPERATION"]:
+			vector_rendered = render_vector_geometry(newFrame, object_id)
+			if not vector_rendered:
+				place_error_image(newFrame)
 		elif processed_json_dict[object_id]["fills"] != null && processed_json_dict[object_id]["fills"] != []:
 			process_colors(processed_json_dict[object_id]["fills"],newFrame)
-		if processed_json_dict[object_id]["border_color"] != [] && processed_json_dict[object_id]["border_color"] != null:
-			newFrame.border_color = Color(processed_json_dict[object_id]["border_color"][0]["color"]["r"],processed_json_dict[object_id]["border_color"][0]["color"]["g"],processed_json_dict[object_id]["border_color"][0]["color"]["b"])
+		var stroke = first_visible_paint(processed_json_dict[object_id]["border_color"], "SOLID")
+		if not stroke.is_empty():
+			newFrame.border_color = paint_color(stroke)
 			newFrame.border_weights = processed_json_dict[object_id]["border_weights"]
 		newFrame.corner_radius = processed_json_dict[object_id]["corner_radius"]
-		if !isRectangle:
+		if !isRectangle and not preserve_figma_layout:
 			if processed_json_dict[object_id]["layout_wrap"] != null:
 				newFrame.layoutWrap = processed_json_dict[object_id]["layout_wrap"]
 				if processed_json_dict[object_id]["layout_wrap"] == "NO_WRAP":
@@ -274,13 +309,119 @@ func renderFrameAndContents(object_id,parent,position_override:bool):
 				newFrame.secondary_spacing = processed_json_dict[object_id]["vertical_gap_spacing"]
 		if processed_json_dict[object_id]["clip_content"] != null:
 			newFrame.clipFrameContents = processed_json_dict[object_id]["clip_content"]
-		newFrame.set_deferred("horizontalAnchor", processed_json_dict[object_id]["horizontalAnchor"])
-		newFrame.set_deferred("verticalAnchor", processed_json_dict[object_id]["verticalAnchor"])
-		newFrame.set_deferred("hLayoutAlign", processed_json_dict[object_id]["hLayout_Align"])
-		newFrame.set_deferred("vLayoutAlign", processed_json_dict[object_id]["vLayout_Align"])
+		if not preserve_figma_layout:
+			newFrame.set_deferred("horizontalAnchor", processed_json_dict[object_id]["horizontalAnchor"])
+			newFrame.set_deferred("verticalAnchor", processed_json_dict[object_id]["verticalAnchor"])
+			newFrame.set_deferred("hLayoutAlign", processed_json_dict[object_id]["hLayout_Align"])
+			newFrame.set_deferred("vLayoutAlign", processed_json_dict[object_id]["vLayout_Align"])
 		if !isRectangle:
 			if processed_json_dict[object_id]["children"] != null && processed_json_dict[object_id]["children"] != []:
 				renderChildFrames(object_id,newFrame.get_node(newFrame.inner_container))
+				if vector_rendered and the_type == "BOOLEAN_OPERATION":
+					# The composite path already contains the boolean result.
+					newFrame.get_node(newFrame.inner_container).hide()
+
+func import_scene_owner() -> Node:
+	var scene_root = get_tree().get_edited_scene_root()
+	return scene_root if scene_root != null else self
+
+func apply_figma_geometry(control:Control, object_id:String, is_root:bool = false) -> void:
+	var data:Dictionary = processed_json_dict[object_id]
+	var transform:Transform2D = Transform2D.IDENTITY
+	var relative = data.get("relativeTransform")
+	if relative is Array and FigmaGradientTexture2D.can_transform_from_array(relative):
+		transform = FigmaGradientTexture2D.transform_from_array(relative)
+	else:
+		transform.origin = Vector2(data.get("x", 0.0), data.get("y", 0.0))
+	# Boolean-operation children can be exported in their ancestor's coordinate space.
+	# Deriving the local transform from absolute matrices handles those nodes as well.
+	var absolute = data.get("absoluteTransform")
+	var parent_data:Dictionary = processed_json_dict.get(data.get("parent", ""), {})
+	var parent_absolute = parent_data.get("absoluteTransform")
+	if absolute is Array and parent_absolute is Array:
+		transform = FigmaGradientTexture2D.transform_from_array(parent_absolute).affine_inverse() * FigmaGradientTexture2D.transform_from_array(absolute)
+	if is_root:
+		transform = Transform2D.IDENTITY
+	control.pivot_offset = Vector2.ZERO
+	control.rotation = transform.get_rotation()
+	control.scale = transform.get_scale()
+	control.position = transform.origin
+	control.visible = data.get("visible", true)
+	control.modulate.a = data.get("opacity", 1.0)
+	if preserve_figma_layout:
+		control.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		control.size = Vector2(data["width"], data["height"])
+
+func first_visible_paint(paints, required_type:String = "") -> Dictionary:
+	if paints is Array:
+		for paint in paints:
+			if paint is Dictionary and paint.get("visible", true) and (required_type.is_empty() or paint.get("type") == required_type):
+				return paint
+	return {}
+
+func paint_color(paint:Dictionary) -> Color:
+	var color_data:Dictionary = paint.get("color", {})
+	return Color(color_data.get("r", 0.0), color_data.get("g", 0.0), color_data.get("b", 0.0), color_data.get("a", 1.0) * paint.get("opacity", 1.0))
+
+func paint_gradient(paint:Dictionary) -> GradientTexture2D:
+	var colors:PackedColorArray = []
+	var offsets:PackedFloat32Array = []
+	for stop in paint.get("gradientStops", []):
+		colors.append(paint_color({"color": stop["color"], "opacity": paint.get("opacity", 1.0)}))
+		offsets.append(stop["position"])
+	var gradient = Gradient.new()
+	gradient.colors = colors
+	gradient.offsets = offsets
+	var texture = FigmaGradientTexture2D.new()
+	texture.gradient = gradient
+	texture.fill = GradientTexture2D.FILL_RADIAL if paint.get("type") == "GRADIENT_RADIAL" else GradientTexture2D.FILL_LINEAR
+	texture.figma_transform_array = paint.get("gradientTransform", [[1, 0, 0], [0, 1, 0]])
+	return texture
+
+func render_vector_geometry(control:Control, object_id:String) -> bool:
+	var data:Dictionary = processed_json_dict[object_id]
+	var geometry = data.get("fillGeometry")
+	if not geometry is Array or geometry.is_empty() or not data["fills"] is Array:
+		return false
+	var definitions:String = ""
+	var paths:String = ""
+	var paints:Array = data["fills"].duplicate()
+	paints.reverse()
+	for index in paints.size():
+		var paint:Dictionary = paints[index]
+		if not paint.get("visible", true):
+			continue
+		var fill:String
+		var opacity:float = 1.0
+		if paint.get("type") == "SOLID":
+			var color = paint_color(paint)
+			fill = "#" + color.to_html(false)
+			opacity = color.a
+		elif paint.get("type") == "GRADIENT_LINEAR":
+			var gradient_texture = paint_gradient(paint)
+			var start = gradient_texture.fill_from
+			var end = gradient_texture.fill_to
+			var gradient_id:String = "gradient_%d" % index
+			definitions += '<linearGradient id="%s" x1="%s" y1="%s" x2="%s" y2="%s">' % [gradient_id, start.x, start.y, end.x, end.y]
+			for stop in paint.get("gradientStops", []):
+				var color = paint_color({"color": stop["color"], "opacity": paint.get("opacity", 1.0)})
+				definitions += '<stop offset="%s" stop-color="#%s" stop-opacity="%s"/>' % [stop["position"], color.to_html(false), color.a]
+			definitions += "</linearGradient>"
+			fill = "url(#%s)" % gradient_id
+		else:
+			continue
+		for path in geometry:
+			var rule:String = "evenodd" if path.get("windingRule") == "EVENODD" else "nonzero"
+			paths += '<path d="%s" fill="%s" fill-opacity="%s" fill-rule="%s"/>' % [str(path["data"]).xml_escape(), fill, opacity, rule]
+	if paths.is_empty():
+		return false
+	var svg:String = '<svg xmlns="http://www.w3.org/2000/svg" width="%s" height="%s" viewBox="0 0 %s %s"><defs>%s</defs>%s</svg>' % [data["width"], data["height"], data["width"], data["height"], definitions, paths]
+	var raster = Image.new()
+	if raster.load_svg_from_string(svg, 2.0) != OK:
+		return false
+	control.fill_texture = ImageTexture.create_from_image(raster)
+	control.textureSizeMode = "Stretch"
+	return true
 
 func checkParentLayoutNone(theParent):
 	if processed_json_dict[theParent]["layout_mode"] != null:
@@ -334,7 +475,7 @@ func process_colors(theColorsArray,theNode):
 							var image_texture = load(file_path) as Texture
 							theNode.fill_texture = image_texture
 							match theColorsArray[aFill]["scaleMode"]:
-								"FIll":
+								"FILL":
 									theNode.textureSizeMode = "Fill"
 								"FIT":
 									theNode.textureSizeMode = "Fit"
@@ -343,8 +484,9 @@ func process_colors(theColorsArray,theNode):
 									theNode.tile_texture = true
 									theNode.zoom = theColorsArray[aFill]["scalingFactor"]
 								"CROP":
-									theNode.textureSizeMode = "Keep Size"
-									theNode.zoom = theColorsArray[aFill]["scalingFactor"]
+									# Exported PNGs already contain the crop. Applying the
+									# source scalingFactor again shrinks decorative images.
+									theNode.textureSizeMode = "Fill"
 						else:
 							place_error_image(theNode)
 
@@ -363,7 +505,7 @@ func renderLine(parent,p_id):
 	var newFrame = HSeparator.new()
 	newFrame.name = processed_json_dict[p_id]["name"]+" xIDx"+ make_safeName(p_id)+"x"
 	parent.add_child(newFrame)
-	newFrame.set_owner(get_tree().get_edited_scene_root())
+	newFrame.set_owner(import_scene_owner())
 	newFrame.set_deferred("size", Vector2(processed_json_dict[p_id]["width"],processed_json_dict[p_id]["stroke_weight"]))
 	if processed_json_dict[p_id]["layout_horiz_sizing"] == "FIXED" && processed_json_dict[p_id]["minWidth"] == null:
 		newFrame.set_deferred("custom_minimum_size:x", processed_json_dict[p_id]["width"])
@@ -387,31 +529,61 @@ func renderTextFrame(parent,p_id):
 	var newFrame = Label.new()
 	var newLabelSettings = LabelSettings.new()
 	newLabelSettings.line_spacing = 0
-	if fonts_folder != null and fonts_folder != "":
-		var dynamic_font = FontFile.new()
+	if fonts_folder != null and fonts_folder != "" and processed_json_dict[p_id]["fontName"] is Dictionary:
 		var font_name = str(processed_json_dict[p_id]["fontName"]["family"]).replace(" ", "")
 		var font_style = str(processed_json_dict[p_id]["fontName"]["style"]).replace(" ", "")
 		var font_location:String = fonts_folder + "/" + font_name + "_" + font_style + ".ttf"
 		if FileAccess.file_exists(font_location):
 			newLabelSettings.font = load(font_location)
-	set_anchor_horizontal_fup(processed_json_dict[p_id]["horizontalAnchor"],newFrame)
-	set_anchor_vertical_fup(processed_json_dict[p_id]["verticalAnchor"],newFrame)
-	if processed_json_dict[p_id]["fills"] != null && processed_json_dict[p_id]["fills"] != []:
-		newLabelSettings.font_color = Color(processed_json_dict[p_id]["fills"][0]["color"]["r"],processed_json_dict[p_id]["fills"][0]["color"]["g"],processed_json_dict[p_id]["fills"][0]["color"]["b"])
 	newLabelSettings.font_size = processed_json_dict[p_id]["fontSize"]
-	if processed_json_dict[p_id]["border_color"] != []:
-		newLabelSettings.outline_color = Color(processed_json_dict[p_id]["border_color"][0]["color"]["r"],processed_json_dict[p_id]["border_color"][0]["color"]["g"],processed_json_dict[p_id]["border_color"][0]["color"]["b"])
-		newLabelSettings.outline_size = processed_json_dict[p_id]["fontStrokeWeight"] * 4
+	var spacing = processed_json_dict[p_id].get("letterSpacing")
+	if spacing is Dictionary and spacing.get("value", 0.0) != 0.0:
+		var variation = FontVariation.new()
+		variation.base_font = newLabelSettings.font
+		var pixels:float = spacing["value"]
+		if spacing.get("unit") == "PERCENT":
+			pixels *= newLabelSettings.font_size / 100.0
+		variation.spacing_glyph = roundi(pixels)
+		newLabelSettings.font = variation
+	var fill = first_visible_paint(processed_json_dict[p_id]["fills"])
+	newLabelSettings.font_color = Color.TRANSPARENT
+	if fill.get("type") == "SOLID":
+		newLabelSettings.font_color = paint_color(fill)
+	elif fill.get("type") in ["GRADIENT_LINEAR", "GRADIENT_RADIAL"]:
+		newLabelSettings.font_color = Color.WHITE
+		var gradient_material = ShaderMaterial.new()
+		gradient_material.shader = load(script_dir + "/shader/text_gradient.gdshader")
+		gradient_material.set_shader_parameter("gradient_texture", paint_gradient(fill))
+		gradient_material.set_shader_parameter("label_size", Vector2(processed_json_dict[p_id]["width"], processed_json_dict[p_id]["height"]))
+		newFrame.material = gradient_material
+	var stroke = first_visible_paint(processed_json_dict[p_id]["border_color"], "SOLID")
+	if not stroke.is_empty():
+		newLabelSettings.outline_color = paint_color(stroke)
+		newLabelSettings.outline_size = roundi(processed_json_dict[p_id]["fontStrokeWeight"])
 	newFrame.name = processed_json_dict[p_id]["name"]+"  xIDx"+ make_safeName(p_id)+"x"
 	parent.add_child(newFrame)
 	newFrame.set_label_settings(newLabelSettings)
-	newFrame.set_owner(get_tree().get_edited_scene_root())
-	newFrame.set_deferred("size", Vector2(processed_json_dict[p_id]["width"],processed_json_dict[p_id]["height"]))
-	newFrame.set_deferred("position", Vector2(processed_json_dict[p_id]["x"],processed_json_dict[p_id]["y"]))
-	newFrame.rotation_degrees = processed_json_dict[p_id]["rotation"] * -1
+	newFrame.set_owner(import_scene_owner())
 	newFrame.text = processed_json_dict[p_id]["characters"]
 	update_textHAlign(processed_json_dict[p_id]["textAlignHorizontal"],newFrame)
 	update_textVAlign(processed_json_dict[p_id]["textAlignVertical"],newFrame)
+	if preserve_figma_layout:
+		newFrame.clip_text = true
+		newFrame.autowrap_mode = TextServer.AUTOWRAP_OFF if processed_json_dict[p_id].get("textAutoResize") == "WIDTH_AND_HEIGHT" else TextServer.AUTOWRAP_WORD_SMART
+		# Figma and Godot round font descent differently. Preserve a single auto-sized
+		# line's exported line box without scaling or moving its glyphs.
+		newFrame.size = Vector2(processed_json_dict[p_id]["width"], processed_json_dict[p_id]["height"])
+		if newFrame.get_line_count() == 1 and not newFrame.text.contains("\n"):
+			var line_difference:int = roundi(processed_json_dict[p_id]["height"] - newFrame.get_line_height())
+			if line_difference < 0:
+				var line_font = FontVariation.new()
+				line_font.base_font = newLabelSettings.font
+				line_font.spacing_bottom = line_difference
+				newLabelSettings.font = line_font
+		apply_figma_geometry.call_deferred(newFrame, p_id)
+		return
+	newFrame.set_deferred("size", Vector2(processed_json_dict[p_id]["width"],processed_json_dict[p_id]["height"]))
+	apply_figma_geometry.call_deferred(newFrame, p_id)
 	if processed_json_dict[p_id]["layout_horiz_sizing"] != "FILL":
 		newFrame.set_deferred("custom_minimum_size", Vector2(processed_json_dict[p_id]["width"],processed_json_dict[p_id]["height"]))
 	else:
@@ -429,7 +601,7 @@ func place_component_inst(parent,p_id):
 		if newFrame.has_meta(remove_after_hashtag(key)) != null:
 			newFrame.set_deferred(remove_after_hashtag(key), processed_json_dict[p_id]["component_properties"][key]["value"])
 	parent.add_child(newFrame)
-	newFrame.set_owner(get_tree().get_edited_scene_root())
+	newFrame.set_owner(import_scene_owner())
 	newFrame.widthSizeMode = processed_json_dict[p_id]["layout_horiz_sizing"]
 	newFrame.heightSizeMode = processed_json_dict[p_id]["layout_vert_sizing"]
 	if processed_json_dict[p_id]["minWidth"] != null:
