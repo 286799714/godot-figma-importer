@@ -66,6 +66,28 @@ func _initialize() -> void:
 	translucent.fill(Color(0.2, 0.4, 0.6, 0.5))
 	Slices.repair_internal_edges(translucent, 1, 1)
 	expect(absf(translucent.get_pixel(0, 0).a - 0.5) < 0.01, "Intentional transparency must not be filled")
+	# The avatar window artwork has 248-253/255 alpha in otherwise solid areas.
+	# Its fractional export fringe must be repaired without making it opaque.
+	for alpha in [248.0 / 255.0, 252.0 / 255.0]:
+		for id in ids:
+			var image = Image.load_from_file(folder.path_join(id + ".png"))
+			for y in image.get_height():
+				for x in image.get_width():
+					var pixel = image.get_pixel(x, y)
+					if pixel.a > 0.9:
+						pixel.a = alpha
+					image.set_pixel(x, y, pixel)
+			image.save_png(folder.path_join(id + ".png"))
+		var almost_opaque = Slices.compose(parent, nodes, folder)
+		expect(not almost_opaque.is_empty(), "Almost-opaque backgrounds must merge")
+		if not almost_opaque.is_empty():
+			var image:Image = almost_opaque.texture.get_image()
+			var interior_alpha = image.get_pixel(3, 3).a
+			for y in range(1, image.get_height() - 1):
+				for x in range(1, image.get_width() - 1):
+					expect(absf(image.get_pixel(x, y).a - interior_alpha) < 0.01, "Almost-opaque seam at %s" % Vector2i(x, y))
+			expect(interior_alpha < 0.99, "Do not force artwork opaque")
+			expect(image.get_pixel(0, 0).a < 0.3, "Almost-opaque artwork must keep its transparent corner")
 	if not failed:
 		print("FIGMA_SLICED_BACKGROUNDS_OK")
 	quit(1 if failed else 0)

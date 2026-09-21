@@ -155,5 +155,7 @@ static func repair_internal_edges(image:Image, column:int, row:int, columns:int 
 
 static func repair_pixel(image:Image, edge:Vector2i, neighbor:Vector2i) -> void:
 	var inside = image.get_pixelv(neighbor)
-	if inside.a >= 0.99 and image.get_pixelv(edge).a < inside.a - 0.01:
+	# Exported artwork can be almost opaque (e.g. 252/255), including its
+	# interior. Keep that alpha when extending it into the clipped edge.
+	if inside.a >= 0.95 and image.get_pixelv(edge).a < inside.a - 0.01:
 		image.set_pixelv(edge, inside)
